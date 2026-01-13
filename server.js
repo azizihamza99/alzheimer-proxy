@@ -30,8 +30,8 @@ const PORT = process.env.PORT || 3000;
 // https://create.arduino.cc/iot/things
 const ARDUINO_CONFIG = {
   // Client credentials (depuis Arduino Cloud → API Keys)
-  CLIENT_ID: '2fdcdcd9-fb5d-438c-a7b8-b6df09dbe082',           // ← À configurer
-  CLIENT_SECRET: 'Oh@A5bav64P19nrjp3zHT?0rB',   // ← À configurer
+  CLIENT_ID: '16f92ff3-1d43-4945-8c58-427eef27baac',           // ← À configurer
+  CLIENT_SECRET: 'zonmPEUkrfpZpgIylpRe98exw',   // ← À configurer
   
   // Thing ID (depuis l'URL de votre Thing)
   THING_ID: '659e4d98-8050-4d24-aafa-1c33d574dcaa',             // ← À configurer
