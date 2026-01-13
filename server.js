@@ -1,21 +1,17 @@
 /*
- * Serveur Proxy - Arduino IoT Cloud
+ * Serveur Proxy - Alzheimer Monitor
+ * Version Standalone (sans Arduino Cloud API)
  * 
- * Ce serveur reçoit les données HTTP de l'ESP32 (via WiFi ou GPRS)
- * et les transmet à Arduino IoT Cloud via l'API.
- * 
- * Fonctionnalités:
- * - Reçoit HTTP POST/GET de l'ESP32
- * - Met à jour les variables Arduino IoT Cloud
+ * Ce serveur:
+ * - Reçoit les données HTTP de l'ESP32 (WiFi ou GPRS)
+ * - Stocke les données localement
+ * - Affiche un dashboard web complet
  * - Gère les alertes et notifications
- * - Journalise les données
- * - API REST pour consultation
  * 
  * Date: Janvier 2026
  */
 
 const express = require('express');
-const axios = require('axios');
 const cors = require('cors');
 const bodyParser = require('body-parser');
 
@@ -23,55 +19,29 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 
 // ═══════════════════════════════════════════════════════════════
-// CONFIGURATION ARDUINO IOT CLOUD
+// CONFIGURATION
 // ═══════════════════════════════════════════════════════════════
 
-// Ces informations sont obtenues depuis Arduino Cloud
-// https://create.arduino.cc/iot/things
-const ARDUINO_CONFIG = {
-  // Client credentials (depuis Arduino Cloud → API Keys)
-  CLIENT_ID: '16f92ff3-1d43-4945-8c58-427eef27baac',           // ← À configurer
-  CLIENT_SECRET: 'zonmPEUkrfpZpgIylpRe98exw',   // ← À configurer
+const CONFIG = {
+  // Seuils d'alerte
+  HEART_RATE_MIN: 50,
+  HEART_RATE_MAX: 120,
   
-  // Thing ID (depuis l'URL de votre Thing)
-  THING_ID: '659e4d98-8050-4d24-aafa-1c33d574dcaa',             // ← À configurer
+  // Position de référence (domicile)
+  HOME_LAT: 34.0331,
+  HOME_LON: -5.0003,
+  GEOFENCE_RADIUS: 100,  // mètres
   
-  // IDs des variables (depuis Arduino Cloud → Thing → Variables)
-  VARIABLES: {
-    location: '8803b5df-5886-450a-807d-194a2d7ea8cb',      // ← À configurer
-    heartRate: '14b9b907-3409-4bb0-b779-26f79347491c',    // ← À configurer
-    cloud_sensors: 'VARIABLE_ID_SENSORS',  // ← À configurer
-    cloud_alerts: 'VARIABLE_ID_ALERTS',    // ← À configurer
-    cloud_command: 'VARIABLE_ID_COMMAND'   // ← À configurer
-  },
+  // Numéros pour alertes
+  PHONE_NUMBERS: ['+212707591033'],
   
-  // URLs API Arduino
-  AUTH_URL: 'https://api2.arduino.cc/iot/v1/clients/token',
-  API_BASE: 'https://api2.arduino.cc/iot/v2'
+  // Webhook pour notifications (optionnel)
+  WEBHOOK_URL: process.env.WEBHOOK_URL || ''
 };
 
 // ═══════════════════════════════════════════════════════════════
-// CONFIGURATION NOTIFICATIONS (Optionnel)
+// STOCKAGE DES DONNÉES
 // ═══════════════════════════════════════════════════════════════
-
-const NOTIFICATION_CONFIG = {
-  // Webhook pour notifications (Telegram, Discord, etc.)
-  WEBHOOK_URL: process.env.WEBHOOK_URL || '',
-  
-  // Numéros pour SMS (via service externe comme Twilio)
-  SMS_ENABLED: false,
-  TWILIO_SID: process.env.TWILIO_SID || '',
-  TWILIO_TOKEN: process.env.TWILIO_TOKEN || '',
-  TWILIO_FROM: process.env.TWILIO_FROM || '',
-  PHONE_NUMBERS: ['+212707591033']
-};
-
-// ═══════════════════════════════════════════════════════════════
-// VARIABLES GLOBALES
-// ═══════════════════════════════════════════════════════════════
-
-let accessToken = null;
-let tokenExpiry = 0;
 
 // Dernières données reçues
 let latestData = {
@@ -83,20 +53,26 @@ let latestData = {
   accelX: 0,
   accelY: 0,
   accelZ: 0,
+  accelMag: 0,
   satellites: 0,
+  gpsValid: false,
+  connectionMode: 'unknown',
+  rssi: 0,
   alerts: {
     fall: false,
     zone: false,
     bpm: false,
     code: 0
-  },
-  connectionMode: 'unknown',
-  rssi: 0
+  }
 };
 
-// Historique (dernières 100 entrées)
+// Historique (dernières 1000 entrées)
 let dataHistory = [];
-const MAX_HISTORY = 100;
+const MAX_HISTORY = 1000;
+
+// Historique des alertes
+let alertHistory = [];
+const MAX_ALERT_HISTORY = 100;
 
 // Stats
 let stats = {
@@ -104,8 +80,13 @@ let stats = {
   successfulUpdates: 0,
   failedUpdates: 0,
   lastUpdate: null,
-  uptime: Date.now()
+  uptime: Date.now(),
+  wifiUpdates: 0,
+  gprsUpdates: 0
 };
+
+// Commande en attente pour l'ESP32
+let pendingCommand = '';
 
 // ═══════════════════════════════════════════════════════════════
 // MIDDLEWARE
@@ -115,7 +96,7 @@ app.use(cors());
 app.use(bodyParser.json());
 app.use(bodyParser.urlencoded({ extended: true }));
 
-// Logger middleware
+// Logger
 app.use((req, res, next) => {
   const timestamp = new Date().toISOString();
   console.log(`[${timestamp}] ${req.method} ${req.path}`);
@@ -123,176 +104,57 @@ app.use((req, res, next) => {
 });
 
 // ═══════════════════════════════════════════════════════════════
-// AUTHENTIFICATION ARDUINO CLOUD
-// ═══════════════════════════════════════════════════════════════
-
-async function getAccessToken() {
-  // Vérifier si le token est encore valide
-  if (accessToken && Date.now() < tokenExpiry - 60000) {
-    return accessToken;
-  }
-  
-  console.log('🔑 Obtention nouveau token Arduino Cloud...');
-  
-  try {
-    const response = await axios.post(ARDUINO_CONFIG.AUTH_URL, 
-      new URLSearchParams({
-        grant_type: 'client_credentials',
-        client_id: ARDUINO_CONFIG.CLIENT_ID,
-        client_secret: ARDUINO_CONFIG.CLIENT_SECRET,
-        audience: 'https://api2.arduino.cc/iot'
-      }), {
-        headers: {
-          'Content-Type': 'application/x-www-form-urlencoded'
-        }
-      }
-    );
-    
-    accessToken = response.data.access_token;
-    tokenExpiry = Date.now() + (response.data.expires_in * 1000);
-    
-    console.log('✅ Token obtenu, expire dans', response.data.expires_in, 'secondes');
-    return accessToken;
-    
-  } catch (error) {
-    console.error('❌ Erreur authentification:', error.response?.data || error.message);
-    throw error;
-  }
-}
-
-// ═══════════════════════════════════════════════════════════════
-// MISE À JOUR ARDUINO CLOUD
-// ═══════════════════════════════════════════════════════════════
-
-async function updateArduinoCloud(data) {
-  const token = await getAccessToken();
-  
-  const headers = {
-    'Authorization': `Bearer ${token}`,
-    'Content-Type': 'application/json'
-  };
-  
-  const thingId = ARDUINO_CONFIG.THING_ID;
-  const baseUrl = `${ARDUINO_CONFIG.API_BASE}/things/${thingId}/properties`;
-  
-  const updates = [];
-  
-  // Variable 1: Location (CloudLocation)
-  if (data.lat && data.lon) {
-    updates.push(
-      axios.put(`${baseUrl}/${ARDUINO_CONFIG.VARIABLES.location}/publish`, {
-        value: { lat: data.lat, lon: data.lon }
-      }, { headers })
-    );
-  }
-  
-  // Variable 2: Heart Rate (int)
-  if (data.heartRate !== undefined) {
-    updates.push(
-      axios.put(`${baseUrl}/${ARDUINO_CONFIG.VARIABLES.heartRate}/publish`, {
-        value: data.heartRate
-      }, { headers })
-    );
-  }
-  
-  // Variable 3: Sensors JSON (String)
-  const sensorsJson = JSON.stringify({
-    temp: data.temperature || 0,
-    ax: data.accelX || 0,
-    ay: data.accelY || 0,
-    az: data.accelZ || 0,
-    mag: data.accelMag || 0,
-    sat: data.satellites || 0,
-    lat: data.lat || 0,
-    lon: data.lon || 0,
-    gps: data.gpsValid || false,
-    mode: data.connectionMode || 'unknown',
-    rssi: data.rssi || 0
-  });
-  
-  updates.push(
-    axios.put(`${baseUrl}/${ARDUINO_CONFIG.VARIABLES.cloud_sensors}/publish`, {
-      value: sensorsJson
-    }, { headers })
-  );
-  
-  // Variable 4: Alerts JSON (String)
-  const alertsJson = JSON.stringify({
-    fall: data.alerts?.fall || false,
-    zone: data.alerts?.zone || false,
-    bpm: data.alerts?.bpm || false,
-    code: data.alerts?.code || 0,
-    active: (data.alerts?.code || 0) > 0
-  });
-  
-  updates.push(
-    axios.put(`${baseUrl}/${ARDUINO_CONFIG.VARIABLES.cloud_alerts}/publish`, {
-      value: alertsJson
-    }, { headers })
-  );
-  
-  // Exécuter toutes les mises à jour
-  const results = await Promise.allSettled(updates);
-  
-  const successful = results.filter(r => r.status === 'fulfilled').length;
-  const failed = results.filter(r => r.status === 'rejected').length;
-  
-  if (failed > 0) {
-    console.log(`⚠️ ${successful}/${results.length} variables mises à jour`);
-    results.forEach((r, i) => {
-      if (r.status === 'rejected') {
-        console.error(`  Variable ${i}: ${r.reason.message}`);
-      }
-    });
-  }
-  
-  return { successful, failed, total: results.length };
-}
-
-// ═══════════════════════════════════════════════════════════════
 // GESTION DES ALERTES
 // ═══════════════════════════════════════════════════════════════
 
 async function handleAlerts(data, previousAlerts) {
   const currentAlerts = data.alerts || { fall: false, zone: false, bpm: false };
-  
-  // Détecter nouvelles alertes
   const newAlerts = [];
   
+  // Détecter nouvelles alertes
   if (currentAlerts.fall && !previousAlerts.fall) {
-    newAlerts.push('🚨 CHUTE DÉTECTÉE!');
+    newAlerts.push({ type: 'fall', message: '🚨 CHUTE DÉTECTÉE!' });
   }
   if (currentAlerts.zone && !previousAlerts.zone) {
-    newAlerts.push('📍 SORTIE DE ZONE!');
+    newAlerts.push({ type: 'zone', message: '📍 SORTIE DE ZONE!' });
   }
   if (currentAlerts.bpm && !previousAlerts.bpm) {
-    newAlerts.push(`❤️ BPM ANORMAL: ${data.heartRate}`);
+    newAlerts.push({ type: 'bpm', message: `❤️ BPM ANORMAL: ${data.heartRate}` });
   }
   
   if (newAlerts.length > 0) {
-    const message = `
-⚠️ ALERTE ALZHEIMER
-${newAlerts.join('\n')}
-
-📍 Position: ${data.lat?.toFixed(6)}, ${data.lon?.toFixed(6)}
-🗺️ https://maps.google.com/?q=${data.lat},${data.lon}
-❤️ BPM: ${data.heartRate}
-🌡️ Temp: ${data.temperature}°C
-⏰ ${new Date().toLocaleString('fr-FR')}
-    `.trim();
+    const alertEntry = {
+      timestamp: new Date().toISOString(),
+      alerts: newAlerts,
+      position: { lat: data.lat, lon: data.lon },
+      heartRate: data.heartRate,
+      temperature: data.temperature
+    };
     
-    console.log('\n' + message + '\n');
+    // Ajouter à l'historique des alertes
+    alertHistory.unshift(alertEntry);
+    if (alertHistory.length > MAX_ALERT_HISTORY) {
+      alertHistory.pop();
+    }
     
-    // Envoyer notification webhook si configuré
-    if (NOTIFICATION_CONFIG.WEBHOOK_URL) {
+    // Log
+    console.log('\n⚠️ ════════════════════════════════════════');
+    console.log('   NOUVELLE ALERTE!');
+    newAlerts.forEach(a => console.log('   ' + a.message));
+    console.log('   Position:', data.lat?.toFixed(6), ',', data.lon?.toFixed(6));
+    console.log('   BPM:', data.heartRate, '| Temp:', data.temperature, '°C');
+    console.log('════════════════════════════════════════════\n');
+    
+    // Webhook si configuré
+    if (CONFIG.WEBHOOK_URL) {
       try {
-        await axios.post(NOTIFICATION_CONFIG.WEBHOOK_URL, {
-          content: message,
-          text: message  // Pour différents formats de webhook
+        const axios = require('axios');
+        await axios.post(CONFIG.WEBHOOK_URL, {
+          content: `⚠️ ALERTE ALZHEIMER\n${newAlerts.map(a => a.message).join('\n')}\n📍 https://maps.google.com/?q=${data.lat},${data.lon}`,
+          text: `ALERTE: ${newAlerts.map(a => a.message).join(', ')}`
         });
-        console.log('✅ Notification webhook envoyée');
       } catch (error) {
-        console.error('❌ Erreur webhook:', error.message);
+        console.error('Erreur webhook:', error.message);
       }
     }
   }
@@ -302,11 +164,16 @@ ${newAlerts.join('\n')}
 // ROUTES API
 // ═══════════════════════════════════════════════════════════════
 
-// Page d'accueil
+// Page d'accueil - Redirection vers dashboard
 app.get('/', (req, res) => {
+  res.redirect('/dashboard');
+});
+
+// Info API
+app.get('/api', (req, res) => {
   res.json({
-    name: 'Alzheimer Monitor Proxy',
-    version: '1.0.0',
+    name: 'Alzheimer Monitor - Standalone Server',
+    version: '2.0.0',
     status: 'running',
     endpoints: {
       'POST /api/data': 'Recevoir données ESP32 (JSON)',
@@ -314,14 +181,17 @@ app.get('/', (req, res) => {
       'GET /api/status': 'Status du serveur',
       'GET /api/latest': 'Dernières données',
       'GET /api/history': 'Historique données',
-      'POST /api/command': 'Envoyer commande à ESP32'
+      'GET /api/alerts': 'Historique alertes',
+      'POST /api/command': 'Envoyer commande',
+      'GET /api/command': 'Récupérer commande en attente',
+      'GET /dashboard': 'Dashboard web complet'
     },
     uptime: Math.floor((Date.now() - stats.uptime) / 1000) + 's'
   });
 });
 
 // ═══════════════════════════════════════════════════════════════
-// ENDPOINT PRINCIPAL - Réception données ESP32
+// RÉCEPTION DES DONNÉES
 // ═══════════════════════════════════════════════════════════════
 
 // POST /api/data - Réception JSON
@@ -330,44 +200,14 @@ app.post('/api/data', async (req, res) => {
   
   try {
     const data = req.body;
+    console.log('📥 Données reçues (POST):', JSON.stringify(data).substring(0, 150) + '...');
     
-    console.log('📥 Données reçues:', JSON.stringify(data).substring(0, 200));
-    
-    // Sauvegarder alertes précédentes pour comparaison
     const previousAlerts = { ...latestData.alerts };
     
     // Parser les données
-    const parsedData = {
-      timestamp: new Date().toISOString(),
-      lat: parseFloat(data.lat) || 0,
-      lon: parseFloat(data.lon) || 0,
-      heartRate: parseInt(data.heartRate) || parseInt(data.hr) || 0,
-      temperature: parseFloat(data.temperature) || parseFloat(data.temp) || 0,
-      accelX: parseFloat(data.accelX) || parseFloat(data.ax) || 0,
-      accelY: parseFloat(data.accelY) || parseFloat(data.ay) || 0,
-      accelZ: parseFloat(data.accelZ) || parseFloat(data.az) || 0,
-      accelMag: parseFloat(data.accelMag) || parseFloat(data.mag) || 0,
-      satellites: parseInt(data.satellites) || parseInt(data.sat) || 0,
-      gpsValid: data.gpsValid === true || data.gps === 'true' || data.gps === true,
-      connectionMode: data.mode || data.connectionMode || 'unknown',
-      rssi: parseInt(data.rssi) || 0,
-      alerts: {
-        fall: data.fall === true || data.fall === 'true' || data.alerts?.fall === true,
-        zone: data.zone === true || data.zone === 'true' || data.alerts?.zone === true,
-        bpm: data.bpm === true || data.bpm === 'true' || data.alerts?.bpm === true,
-        code: parseInt(data.alertCode) || parseInt(data.code) || parseInt(data.alerts?.code) || 0
-      }
-    };
+    const parsedData = parseIncomingData(data);
     
-    // Calculer code alerte si non fourni
-    if (parsedData.alerts.code === 0) {
-      parsedData.alerts.code = 
-        (parsedData.alerts.fall ? 1 : 0) +
-        (parsedData.alerts.zone ? 2 : 0) +
-        (parsedData.alerts.bpm ? 4 : 0);
-    }
-    
-    // Mettre à jour les données
+    // Mettre à jour
     latestData = parsedData;
     
     // Ajouter à l'historique
@@ -379,85 +219,47 @@ app.post('/api/data', async (req, res) => {
     // Gérer les alertes
     await handleAlerts(parsedData, previousAlerts);
     
-    // Envoyer à Arduino Cloud
-    let cloudResult = { successful: 0, failed: 0, total: 0 };
-    
-    if (ARDUINO_CONFIG.CLIENT_ID !== 'VOTRE_CLIENT_ID') {
-      try {
-        cloudResult = await updateArduinoCloud(parsedData);
-        stats.successfulUpdates++;
-        console.log(`☁️ Arduino Cloud: ${cloudResult.successful}/${cloudResult.total} OK`);
-      } catch (error) {
-        stats.failedUpdates++;
-        console.error('❌ Erreur Arduino Cloud:', error.message);
-      }
+    // Stats
+    stats.successfulUpdates++;
+    stats.lastUpdate = new Date().toISOString();
+    if (parsedData.connectionMode === 'wifi') {
+      stats.wifiUpdates++;
     } else {
-      console.log('⚠️ Arduino Cloud non configuré - données stockées localement');
+      stats.gprsUpdates++;
     }
     
-    stats.lastUpdate = new Date().toISOString();
+    console.log(`✅ Données enregistrées | Mode: ${parsedData.connectionMode} | BPM: ${parsedData.heartRate} | Alertes: ${parsedData.alerts.code}`);
     
-    // Réponse à l'ESP32
     res.json({
       success: true,
       message: 'Data received',
-      cloud: cloudResult,
-      timestamp: parsedData.timestamp
+      timestamp: parsedData.timestamp,
+      command: pendingCommand  // Renvoyer commande en attente
     });
+    
+    // Clear commande après envoi
+    if (pendingCommand) {
+      console.log(`📤 Commande envoyée à ESP32: ${pendingCommand}`);
+      pendingCommand = '';
+    }
     
   } catch (error) {
     stats.failedUpdates++;
-    console.error('❌ Erreur traitement:', error.message);
-    res.status(500).json({
-      success: false,
-      error: error.message
-    });
+    console.error('❌ Erreur:', error.message);
+    res.status(500).json({ success: false, error: error.message });
   }
 });
 
-// GET /api/data - Réception via query params (pour SIM900 simple)
+// GET /api/data - Réception via query params (pour SIM900)
 app.get('/api/data', async (req, res) => {
-  // Convertir query params en body et traiter
-  req.body = req.query;
-  
-  // Réutiliser la logique POST
   stats.totalRequests++;
   
   try {
     const data = req.query;
-    
-    console.log('📥 Données reçues (GET):', JSON.stringify(data).substring(0, 200));
+    console.log('📥 Données reçues (GET):', JSON.stringify(data).substring(0, 150) + '...');
     
     const previousAlerts = { ...latestData.alerts };
-    
-    const parsedData = {
-      timestamp: new Date().toISOString(),
-      lat: parseFloat(data.lat) || 0,
-      lon: parseFloat(data.lon) || 0,
-      heartRate: parseInt(data.hr) || 0,
-      temperature: parseFloat(data.temp) || 0,
-      accelX: parseFloat(data.ax) || 0,
-      accelY: parseFloat(data.ay) || 0,
-      accelZ: parseFloat(data.az) || 0,
-      accelMag: parseFloat(data.mag) || 0,
-      satellites: parseInt(data.sat) || 0,
-      gpsValid: data.gps === 'true' || data.gps === '1',
-      connectionMode: data.mode || 'gprs',
-      rssi: parseInt(data.rssi) || 0,
-      alerts: {
-        fall: data.fall === 'true' || data.fall === '1',
-        zone: data.zone === 'true' || data.zone === '1',
-        bpm: data.bpm === 'true' || data.bpm === '1',
-        code: parseInt(data.code) || 0
-      }
-    };
-    
-    if (parsedData.alerts.code === 0) {
-      parsedData.alerts.code = 
-        (parsedData.alerts.fall ? 1 : 0) +
-        (parsedData.alerts.zone ? 2 : 0) +
-        (parsedData.alerts.bpm ? 4 : 0);
-    }
+    const parsedData = parseIncomingData(data);
     
     latestData = parsedData;
     
@@ -468,19 +270,15 @@ app.get('/api/data', async (req, res) => {
     
     await handleAlerts(parsedData, previousAlerts);
     
-    let cloudResult = { successful: 0, failed: 0, total: 0 };
-    
-    if (ARDUINO_CONFIG.CLIENT_ID !== 'VOTRE_CLIENT_ID') {
-      try {
-        cloudResult = await updateArduinoCloud(parsedData);
-        stats.successfulUpdates++;
-      } catch (error) {
-        stats.failedUpdates++;
-        console.error('❌ Erreur Arduino Cloud:', error.message);
-      }
+    stats.successfulUpdates++;
+    stats.lastUpdate = new Date().toISOString();
+    if (parsedData.connectionMode === 'wifi') {
+      stats.wifiUpdates++;
+    } else {
+      stats.gprsUpdates++;
     }
     
-    stats.lastUpdate = new Date().toISOString();
+    console.log(`✅ OK | Mode: ${parsedData.connectionMode} | BPM: ${parsedData.heartRate}`);
     
     // Réponse simple pour SIM900
     res.send('OK');
@@ -492,8 +290,43 @@ app.get('/api/data', async (req, res) => {
   }
 });
 
+// Parser les données entrantes
+function parseIncomingData(data) {
+  const parsed = {
+    timestamp: new Date().toISOString(),
+    lat: parseFloat(data.lat) || 0,
+    lon: parseFloat(data.lon) || 0,
+    heartRate: parseInt(data.heartRate) || parseInt(data.hr) || 0,
+    temperature: parseFloat(data.temperature) || parseFloat(data.temp) || 0,
+    accelX: parseFloat(data.accelX) || parseFloat(data.ax) || 0,
+    accelY: parseFloat(data.accelY) || parseFloat(data.ay) || 0,
+    accelZ: parseFloat(data.accelZ) || parseFloat(data.az) || 0,
+    accelMag: parseFloat(data.accelMag) || parseFloat(data.mag) || 0,
+    satellites: parseInt(data.satellites) || parseInt(data.sat) || 0,
+    gpsValid: data.gpsValid === true || data.gps === 'true' || data.gps === true,
+    connectionMode: data.mode || data.connectionMode || 'unknown',
+    rssi: parseInt(data.rssi) || 0,
+    alerts: {
+      fall: data.fall === true || data.fall === 'true',
+      zone: data.zone === true || data.zone === 'true',
+      bpm: data.bpm === true || data.bpm === 'true',
+      code: parseInt(data.alertCode) || parseInt(data.code) || 0
+    }
+  };
+  
+  // Calculer code alerte si non fourni
+  if (parsed.alerts.code === 0) {
+    parsed.alerts.code = 
+      (parsed.alerts.fall ? 1 : 0) +
+      (parsed.alerts.zone ? 2 : 0) +
+      (parsed.alerts.bpm ? 4 : 0);
+  }
+  
+  return parsed;
+}
+
 // ═══════════════════════════════════════════════════════════════
-// ENDPOINTS STATUS ET DONNÉES
+// ENDPOINTS DONNÉES
 // ═══════════════════════════════════════════════════════════════
 
 // Status du serveur
@@ -501,22 +334,25 @@ app.get('/api/status', (req, res) => {
   res.json({
     status: 'running',
     uptime: Math.floor((Date.now() - stats.uptime) / 1000),
+    uptimeFormatted: formatUptime(Date.now() - stats.uptime),
     stats: {
       totalRequests: stats.totalRequests,
       successfulUpdates: stats.successfulUpdates,
       failedUpdates: stats.failedUpdates,
+      wifiUpdates: stats.wifiUpdates,
+      gprsUpdates: stats.gprsUpdates,
       lastUpdate: stats.lastUpdate
-    },
-    arduinoCloud: {
-      configured: ARDUINO_CONFIG.CLIENT_ID !== 'VOTRE_CLIENT_ID',
-      tokenValid: accessToken && Date.now() < tokenExpiry
     },
     latestData: {
       timestamp: latestData.timestamp,
       hasGPS: latestData.lat !== 0,
       heartRate: latestData.heartRate,
+      temperature: latestData.temperature,
+      connectionMode: latestData.connectionMode,
       alertsActive: latestData.alerts.code > 0
-    }
+    },
+    historyCount: dataHistory.length,
+    alertCount: alertHistory.length
   });
 });
 
@@ -527,16 +363,25 @@ app.get('/api/latest', (req, res) => {
 
 // Historique
 app.get('/api/history', (req, res) => {
-  const limit = parseInt(req.query.limit) || 50;
+  const limit = Math.min(parseInt(req.query.limit) || 100, MAX_HISTORY);
   res.json({
     count: dataHistory.length,
+    limit: limit,
     data: dataHistory.slice(0, limit)
   });
 });
 
-// Envoyer commande (stockée pour l'ESP32)
-let pendingCommand = '';
+// Historique des alertes
+app.get('/api/alerts', (req, res) => {
+  const limit = Math.min(parseInt(req.query.limit) || 50, MAX_ALERT_HISTORY);
+  res.json({
+    count: alertHistory.length,
+    limit: limit,
+    alerts: alertHistory.slice(0, limit)
+  });
+});
 
+// Envoyer commande
 app.post('/api/command', (req, res) => {
   const { command } = req.body;
   
@@ -549,19 +394,27 @@ app.post('/api/command', (req, res) => {
   
   res.json({
     success: true,
-    command: pendingCommand
+    command: pendingCommand,
+    message: 'Command will be sent on next ESP32 request'
   });
 });
 
-// L'ESP32 peut récupérer les commandes en attente
+// Récupérer commande en attente
 app.get('/api/command', (req, res) => {
   const cmd = pendingCommand;
-  pendingCommand = '';  // Clear après lecture
+  pendingCommand = '';
   res.json({ command: cmd });
 });
 
+// Reset alertes (via API)
+app.post('/api/reset', (req, res) => {
+  latestData.alerts = { fall: false, zone: false, bpm: false, code: 0 };
+  pendingCommand = 'RESET';
+  res.json({ success: true, message: 'Alerts reset, command queued' });
+});
+
 // ═══════════════════════════════════════════════════════════════
-// PAGE WEB SIMPLE (Dashboard minimal)
+// DASHBOARD WEB COMPLET
 // ═══════════════════════════════════════════════════════════════
 
 app.get('/dashboard', (req, res) => {
@@ -571,152 +424,581 @@ app.get('/dashboard', (req, res) => {
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Alzheimer Monitor</title>
+  <meta http-equiv="refresh" content="300">
+  <title>🧠 Alzheimer Monitor</title>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
   <style>
     * { margin: 0; padding: 0; box-sizing: border-box; }
-    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #1a1a2e; color: #eee; padding: 20px; }
-    .container { max-width: 1200px; margin: 0 auto; }
-    h1 { text-align: center; margin-bottom: 30px; color: #00d4ff; }
-    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 20px; }
-    .card { background: #16213e; border-radius: 15px; padding: 20px; box-shadow: 0 4px 15px rgba(0,0,0,0.3); }
-    .card h2 { color: #00d4ff; margin-bottom: 15px; font-size: 1.2em; }
-    .value { font-size: 2.5em; font-weight: bold; color: #fff; }
-    .unit { font-size: 0.5em; color: #888; }
-    .alert { background: #ff4757; animation: pulse 1s infinite; }
-    .ok { background: #2ed573; }
-    .status { display: inline-block; padding: 5px 15px; border-radius: 20px; margin: 5px; font-size: 0.9em; }
-    @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.7; } }
-    #map { height: 300px; border-radius: 10px; }
-    .timestamp { text-align: center; color: #666; margin-top: 20px; }
-    .command-input { display: flex; gap: 10px; margin-top: 15px; }
-    .command-input input { flex: 1; padding: 10px; border-radius: 8px; border: none; background: #0f3460; color: #fff; }
-    .command-input button { padding: 10px 20px; border-radius: 8px; border: none; background: #00d4ff; color: #000; cursor: pointer; font-weight: bold; }
+    
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+      color: #eee;
+      min-height: 100vh;
+    }
+    
+    .header {
+      background: rgba(0, 212, 255, 0.1);
+      padding: 15px 20px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      border-bottom: 1px solid rgba(0, 212, 255, 0.3);
+    }
+    
+    .header h1 {
+      font-size: 1.5em;
+      color: #00d4ff;
+    }
+    
+    .header .status {
+      display: flex;
+      align-items: center;
+      gap: 15px;
+    }
+    
+    .status-dot {
+      width: 12px;
+      height: 12px;
+      border-radius: 50%;
+      background: #2ed573;
+      animation: pulse 2s infinite;
+    }
+    
+    .status-dot.offline { background: #ff4757; animation: none; }
+    .status-dot.warning { background: #ffa502; }
+    
+    @keyframes pulse {
+      0%, 100% { opacity: 1; transform: scale(1); }
+      50% { opacity: 0.7; transform: scale(1.1); }
+    }
+    
+    .container {
+      max-width: 1400px;
+      margin: 0 auto;
+      padding: 20px;
+    }
+    
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+      gap: 20px;
+      margin-bottom: 20px;
+    }
+    
+    .card {
+      background: rgba(22, 33, 62, 0.8);
+      border-radius: 15px;
+      padding: 20px;
+      box-shadow: 0 4px 20px rgba(0, 0, 0, 0.3);
+      border: 1px solid rgba(0, 212, 255, 0.1);
+      transition: transform 0.3s, box-shadow 0.3s;
+    }
+    
+    .card:hover {
+      transform: translateY(-2px);
+      box-shadow: 0 8px 30px rgba(0, 212, 255, 0.2);
+    }
+    
+    .card h2 {
+      color: #00d4ff;
+      margin-bottom: 15px;
+      font-size: 1.1em;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    
+    .card .value {
+      font-size: 3em;
+      font-weight: bold;
+      color: #fff;
+    }
+    
+    .card .unit {
+      font-size: 0.4em;
+      color: #888;
+      margin-left: 5px;
+    }
+    
+    .card .subtitle {
+      color: #666;
+      font-size: 0.9em;
+      margin-top: 5px;
+    }
+    
+    .card-wide {
+      grid-column: span 2;
+    }
+    
+    @media (max-width: 768px) {
+      .card-wide { grid-column: span 1; }
+    }
+    
+    /* Alertes */
+    .alerts-container {
+      display: flex;
+      gap: 10px;
+      flex-wrap: wrap;
+    }
+    
+    .alert-badge {
+      padding: 8px 16px;
+      border-radius: 20px;
+      font-size: 0.9em;
+      font-weight: 500;
+      transition: all 0.3s;
+    }
+    
+    .alert-badge.ok {
+      background: rgba(46, 213, 115, 0.2);
+      color: #2ed573;
+      border: 1px solid #2ed573;
+    }
+    
+    .alert-badge.danger {
+      background: rgba(255, 71, 87, 0.3);
+      color: #ff4757;
+      border: 1px solid #ff4757;
+      animation: alertPulse 1s infinite;
+    }
+    
+    @keyframes alertPulse {
+      0%, 100% { opacity: 1; }
+      50% { opacity: 0.6; }
+    }
+    
+    /* Carte */
+    #map {
+      height: 350px;
+      border-radius: 10px;
+      border: 1px solid rgba(0, 212, 255, 0.2);
+    }
+    
+    .coordinates {
+      margin-top: 10px;
+      color: #888;
+      font-family: monospace;
+      font-size: 0.9em;
+    }
+    
+    /* Commandes */
+    .command-section {
+      display: flex;
+      gap: 10px;
+      flex-wrap: wrap;
+    }
+    
+    .command-btn {
+      padding: 10px 20px;
+      border-radius: 8px;
+      border: none;
+      cursor: pointer;
+      font-weight: 600;
+      transition: all 0.3s;
+    }
+    
+    .command-btn.primary {
+      background: #00d4ff;
+      color: #000;
+    }
+    
+    .command-btn.danger {
+      background: #ff4757;
+      color: #fff;
+    }
+    
+    .command-btn.secondary {
+      background: rgba(255, 255, 255, 0.1);
+      color: #fff;
+      border: 1px solid rgba(255, 255, 255, 0.2);
+    }
+    
+    .command-btn:hover {
+      transform: scale(1.05);
+    }
+    
+    .command-input {
+      flex: 1;
+      min-width: 150px;
+      padding: 10px 15px;
+      border-radius: 8px;
+      border: 1px solid rgba(0, 212, 255, 0.3);
+      background: rgba(0, 0, 0, 0.3);
+      color: #fff;
+      font-size: 1em;
+    }
+    
+    .command-input::placeholder {
+      color: #666;
+    }
+    
+    /* Stats */
+    .stats-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+      gap: 15px;
+    }
+    
+    .stat-item {
+      text-align: center;
+      padding: 15px;
+      background: rgba(0, 0, 0, 0.2);
+      border-radius: 10px;
+    }
+    
+    .stat-item .stat-value {
+      font-size: 1.8em;
+      font-weight: bold;
+      color: #00d4ff;
+    }
+    
+    .stat-item .stat-label {
+      font-size: 0.8em;
+      color: #888;
+      margin-top: 5px;
+    }
+    
+    /* Historique alertes */
+    .alert-history {
+      max-height: 200px;
+      overflow-y: auto;
+    }
+    
+    .alert-item {
+      padding: 10px;
+      margin-bottom: 8px;
+      background: rgba(255, 71, 87, 0.1);
+      border-radius: 8px;
+      border-left: 3px solid #ff4757;
+      font-size: 0.9em;
+    }
+    
+    .alert-item .time {
+      color: #888;
+      font-size: 0.8em;
+    }
+    
+    /* Footer */
+    .footer {
+      text-align: center;
+      padding: 20px;
+      color: #666;
+      font-size: 0.9em;
+    }
+    
+    /* Responsive */
+    @media (max-width: 600px) {
+      .header { flex-direction: column; gap: 10px; }
+      .card .value { font-size: 2.5em; }
+    }
   </style>
-  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
 </head>
 <body>
-  <div class="container">
+  <div class="header">
     <h1>🧠 Alzheimer Monitor</h1>
+    <div class="status">
+      <span id="connectionStatus">Connexion...</span>
+      <div class="status-dot" id="statusDot"></div>
+      <span id="lastUpdate">--</span>
+    </div>
+  </div>
+  
+  <div class="container">
+    <!-- Alertes -->
+    <div class="card" id="alertCard" style="margin-bottom: 20px;">
+      <h2>⚠️ État des Alertes</h2>
+      <div class="alerts-container" id="alertsContainer">
+        <span class="alert-badge ok" id="alertFall">✓ Chute</span>
+        <span class="alert-badge ok" id="alertZone">✓ Zone</span>
+        <span class="alert-badge ok" id="alertBpm">✓ BPM</span>
+      </div>
+    </div>
     
+    <!-- Données principales -->
     <div class="grid">
       <div class="card">
         <h2>❤️ Rythme Cardiaque</h2>
-        <div class="value" id="heartRate">--<span class="unit"> BPM</span></div>
+        <div class="value" id="heartRate">--<span class="unit">BPM</span></div>
+        <div class="subtitle">Normal: 50-120 BPM</div>
       </div>
       
       <div class="card">
         <h2>🌡️ Température</h2>
-        <div class="value" id="temperature">--<span class="unit"> °C</span></div>
+        <div class="value" id="temperature">--<span class="unit">°C</span></div>
+        <div class="subtitle">Température corporelle</div>
       </div>
       
       <div class="card">
-        <h2>📡 Connexion</h2>
-        <div class="value" id="connection">--</div>
+        <h2>📡 Mode Connexion</h2>
+        <div class="value" id="connectionMode">--</div>
+        <div class="subtitle" id="rssi">Signal: --</div>
       </div>
       
       <div class="card">
         <h2>🛰️ GPS</h2>
-        <div class="value" id="satellites">--<span class="unit"> sat</span></div>
+        <div class="value" id="satellites">--<span class="unit">sat</span></div>
+        <div class="subtitle" id="gpsStatus">En attente...</div>
       </div>
     </div>
     
-    <div class="card" style="margin-top: 20px;">
-      <h2>⚠️ Alertes</h2>
-      <div id="alerts">
-        <span class="status ok" id="alertFall">Chute: OK</span>
-        <span class="status ok" id="alertZone">Zone: OK</span>
-        <span class="status ok" id="alertBpm">BPM: OK</span>
-      </div>
-    </div>
-    
-    <div class="card" style="margin-top: 20px;">
-      <h2>📍 Position</h2>
+    <!-- Carte -->
+    <div class="card card-wide">
+      <h2>📍 Position GPS</h2>
       <div id="map"></div>
-      <div id="coordinates" style="margin-top: 10px; color: #888;"></div>
+      <div class="coordinates" id="coordinates">Coordonnées: --</div>
     </div>
     
-    <div class="card" style="margin-top: 20px;">
-      <h2>🎮 Commandes</h2>
-      <div class="command-input">
-        <input type="text" id="commandInput" placeholder="RESET, SMS, LOCATE, FALL...">
-        <button onclick="sendCommand()">Envoyer</button>
+    <!-- Accélération -->
+    <div class="card">
+      <h2>📊 Accélération</h2>
+      <div style="display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; text-align: center;">
+        <div>
+          <div style="font-size: 1.5em; color: #ff6b6b;" id="accelX">0.00</div>
+          <div style="color: #888; font-size: 0.8em;">X</div>
+        </div>
+        <div>
+          <div style="font-size: 1.5em; color: #4ecdc4;" id="accelY">0.00</div>
+          <div style="color: #888; font-size: 0.8em;">Y</div>
+        </div>
+        <div>
+          <div style="font-size: 1.5em; color: #45b7d1;" id="accelZ">0.00</div>
+          <div style="color: #888; font-size: 0.8em;">Z</div>
+        </div>
+      </div>
+      <div style="margin-top: 15px; text-align: center;">
+        <span style="font-size: 0.9em; color: #888;">Magnitude:</span>
+        <span style="font-size: 1.2em; font-weight: bold;" id="accelMag">0.00</span>
+        <span style="color: #888;">g</span>
       </div>
     </div>
     
-    <div class="timestamp">
-      Dernière mise à jour: <span id="lastUpdate">--</span>
+    <!-- Commandes -->
+    <div class="card">
+      <h2>🎮 Commandes</h2>
+      <div class="command-section">
+        <button class="command-btn primary" onclick="sendCommand('RESET')">Reset Alertes</button>
+        <button class="command-btn secondary" onclick="sendCommand('STATUS')">Status</button>
+        <button class="command-btn secondary" onclick="sendCommand('LOCATE')">Localiser</button>
+        <button class="command-btn danger" onclick="sendCommand('FALL_TEST')">Test Chute</button>
+      </div>
+      <div class="command-section" style="margin-top: 10px;">
+        <input type="text" class="command-input" id="customCommand" placeholder="Commande personnalisée...">
+        <button class="command-btn primary" onclick="sendCustomCommand()">Envoyer</button>
+      </div>
     </div>
+    
+    <!-- Stats -->
+    <div class="card">
+      <h2>📈 Statistiques</h2>
+      <div class="stats-grid">
+        <div class="stat-item">
+          <div class="stat-value" id="statTotal">0</div>
+          <div class="stat-label">Total</div>
+        </div>
+        <div class="stat-item">
+          <div class="stat-value" id="statWifi">0</div>
+          <div class="stat-label">WiFi</div>
+        </div>
+        <div class="stat-item">
+          <div class="stat-value" id="statGprs">0</div>
+          <div class="stat-label">GPRS</div>
+        </div>
+        <div class="stat-item">
+          <div class="stat-value" id="statUptime">0</div>
+          <div class="stat-label">Uptime (h)</div>
+        </div>
+      </div>
+    </div>
+    
+    <!-- Historique alertes -->
+    <div class="card">
+      <h2>🔔 Historique Alertes</h2>
+      <div class="alert-history" id="alertHistory">
+        <p style="color: #666; text-align: center;">Aucune alerte récente</p>
+      </div>
+    </div>
+  </div>
+  
+  <div class="footer">
+    Alzheimer Monitor v2.0 | Proxy Server Standalone<br>
+    Dernière mise à jour: <span id="footerTime">--</span>
   </div>
   
   <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
   <script>
-    // Carte
+    // Initialisation carte
     const map = L.map('map').setView([34.0331, -5.0003], 15);
-    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png').addTo(map);
-    let marker = L.marker([34.0331, -5.0003]).addTo(map);
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+      attribution: '© OpenStreetMap'
+    }).addTo(map);
     
-    // Mise à jour données
+    let marker = L.marker([34.0331, -5.0003]).addTo(map);
+    let pathCoords = [];
+    let pathLine = null;
+    
+    // Mise à jour des données
     async function updateData() {
       try {
         const response = await fetch('/api/latest');
         const data = await response.json();
         
-        document.getElementById('heartRate').innerHTML = (data.heartRate || '--') + '<span class="unit"> BPM</span>';
-        document.getElementById('temperature').innerHTML = (data.temperature?.toFixed(1) || '--') + '<span class="unit"> °C</span>';
-        document.getElementById('connection').textContent = data.connectionMode?.toUpperCase() || '--';
-        document.getElementById('satellites').innerHTML = (data.satellites || '--') + '<span class="unit"> sat</span>';
+        // Status connexion
+        const now = new Date();
+        const lastUpdate = data.timestamp ? new Date(data.timestamp) : null;
+        const diffSeconds = lastUpdate ? (now - lastUpdate) / 1000 : 999;
+        
+        const statusDot = document.getElementById('statusDot');
+        const connectionStatus = document.getElementById('connectionStatus');
+        
+        if (diffSeconds < 30) {
+          statusDot.className = 'status-dot';
+          connectionStatus.textContent = 'En ligne';
+        } else if (diffSeconds < 120) {
+          statusDot.className = 'status-dot warning';
+          connectionStatus.textContent = 'Retard';
+        } else {
+          statusDot.className = 'status-dot offline';
+          connectionStatus.textContent = 'Hors ligne';
+        }
+        
+        // Valeurs
+        document.getElementById('heartRate').innerHTML = (data.heartRate || '--') + '<span class="unit">BPM</span>';
+        document.getElementById('temperature').innerHTML = (data.temperature?.toFixed(1) || '--') + '<span class="unit">°C</span>';
+        document.getElementById('connectionMode').textContent = (data.connectionMode || '--').toUpperCase();
+        document.getElementById('rssi').textContent = data.rssi ? 'Signal: ' + data.rssi + ' dBm' : 'Signal: --';
+        document.getElementById('satellites').innerHTML = (data.satellites || '--') + '<span class="unit">sat</span>';
+        document.getElementById('gpsStatus').textContent = data.gpsValid ? 'GPS actif' : 'Recherche...';
+        
+        // Accélération
+        document.getElementById('accelX').textContent = data.accelX?.toFixed(2) || '0.00';
+        document.getElementById('accelY').textContent = data.accelY?.toFixed(2) || '0.00';
+        document.getElementById('accelZ').textContent = data.accelZ?.toFixed(2) || '0.00';
+        document.getElementById('accelMag').textContent = data.accelMag?.toFixed(2) || '0.00';
         
         // Alertes
-        const alertFall = document.getElementById('alertFall');
-        const alertZone = document.getElementById('alertZone');
-        const alertBpm = document.getElementById('alertBpm');
+        updateAlert('alertFall', 'Chute', data.alerts?.fall);
+        updateAlert('alertZone', 'Zone', data.alerts?.zone);
+        updateAlert('alertBpm', 'BPM', data.alerts?.bpm);
         
-        alertFall.className = 'status ' + (data.alerts?.fall ? 'alert' : 'ok');
-        alertFall.textContent = 'Chute: ' + (data.alerts?.fall ? '⚠️ ALERTE' : 'OK');
-        
-        alertZone.className = 'status ' + (data.alerts?.zone ? 'alert' : 'ok');
-        alertZone.textContent = 'Zone: ' + (data.alerts?.zone ? '⚠️ ALERTE' : 'OK');
-        
-        alertBpm.className = 'status ' + (data.alerts?.bpm ? 'alert' : 'ok');
-        alertBpm.textContent = 'BPM: ' + (data.alerts?.bpm ? '⚠️ ALERTE' : 'OK');
+        // Card alerte
+        const alertCard = document.getElementById('alertCard');
+        if (data.alerts?.code > 0) {
+          alertCard.style.borderColor = '#ff4757';
+          alertCard.style.background = 'rgba(255, 71, 87, 0.1)';
+        } else {
+          alertCard.style.borderColor = 'rgba(0, 212, 255, 0.1)';
+          alertCard.style.background = 'rgba(22, 33, 62, 0.8)';
+        }
         
         // Carte
         if (data.lat && data.lon && data.lat !== 0) {
-          marker.setLatLng([data.lat, data.lon]);
-          map.setView([data.lat, data.lon], 15);
-          document.getElementById('coordinates').textContent = data.lat.toFixed(6) + ', ' + data.lon.toFixed(6);
+          const newPos = [data.lat, data.lon];
+          marker.setLatLng(newPos);
+          map.setView(newPos, 16);
+          document.getElementById('coordinates').textContent = 
+            'Coordonnées: ' + data.lat.toFixed(6) + ', ' + data.lon.toFixed(6);
+          
+          // Tracer le chemin
+          pathCoords.push(newPos);
+          if (pathCoords.length > 100) pathCoords.shift();
+          if (pathLine) map.removeLayer(pathLine);
+          if (pathCoords.length > 1) {
+            pathLine = L.polyline(pathCoords, {color: '#00d4ff', weight: 3, opacity: 0.7}).addTo(map);
+          }
         }
         
-        document.getElementById('lastUpdate').textContent = data.timestamp ? new Date(data.timestamp).toLocaleString('fr-FR') : '--';
+        // Timestamp
+        document.getElementById('lastUpdate').textContent = 
+          lastUpdate ? lastUpdate.toLocaleTimeString('fr-FR') : '--';
+        document.getElementById('footerTime').textContent = 
+          now.toLocaleString('fr-FR');
         
       } catch (error) {
-        console.error('Erreur:', error);
+        console.error('Erreur update:', error);
       }
     }
     
-    // Envoyer commande
-    async function sendCommand() {
-      const input = document.getElementById('commandInput');
-      const command = input.value.trim();
-      
-      if (!command) return;
-      
+    // Mise à jour stats
+    async function updateStats() {
       try {
-        await fetch('/api/command', {
+        const response = await fetch('/api/status');
+        const data = await response.json();
+        
+        document.getElementById('statTotal').textContent = data.stats.successfulUpdates || 0;
+        document.getElementById('statWifi').textContent = data.stats.wifiUpdates || 0;
+        document.getElementById('statGprs').textContent = data.stats.gprsUpdates || 0;
+        document.getElementById('statUptime').textContent = Math.floor(data.uptime / 3600);
+        
+      } catch (error) {
+        console.error('Erreur stats:', error);
+      }
+    }
+    
+    // Mise à jour historique alertes
+    async function updateAlertHistory() {
+      try {
+        const response = await fetch('/api/alerts?limit=10');
+        const data = await response.json();
+        
+        const container = document.getElementById('alertHistory');
+        
+        if (data.alerts && data.alerts.length > 0) {
+          container.innerHTML = data.alerts.map(alert => {
+            const time = new Date(alert.timestamp).toLocaleString('fr-FR');
+            const messages = alert.alerts.map(a => a.message).join(', ');
+            return '<div class="alert-item"><div class="time">' + time + '</div>' + messages + '</div>';
+          }).join('');
+        } else {
+          container.innerHTML = '<p style="color: #666; text-align: center;">Aucune alerte récente</p>';
+        }
+        
+      } catch (error) {
+        console.error('Erreur alertHistory:', error);
+      }
+    }
+    
+    function updateAlert(id, label, isActive) {
+      const el = document.getElementById(id);
+      if (isActive) {
+        el.className = 'alert-badge danger';
+        el.textContent = '⚠️ ' + label;
+      } else {
+        el.className = 'alert-badge ok';
+        el.textContent = '✓ ' + label;
+      }
+    }
+    
+    async function sendCommand(cmd) {
+      try {
+        const response = await fetch('/api/command', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ command })
+          body: JSON.stringify({ command: cmd })
         });
-        input.value = '';
-        alert('Commande envoyée: ' + command);
+        const data = await response.json();
+        alert('Commande envoyée: ' + cmd);
       } catch (error) {
         alert('Erreur: ' + error.message);
       }
     }
     
-    // Mise à jour auto toutes les 5 secondes
+    function sendCustomCommand() {
+      const input = document.getElementById('customCommand');
+      const cmd = input.value.trim();
+      if (cmd) {
+        sendCommand(cmd);
+        input.value = '';
+      }
+    }
+    
+    // Mise à jour automatique
     updateData();
-    setInterval(updateData, 5000);
+    updateStats();
+    updateAlertHistory();
+    setInterval(updateData, 3000);
+    setInterval(updateStats, 10000);
+    setInterval(updateAlertHistory, 15000);
   </script>
 </body>
 </html>
@@ -726,33 +1008,42 @@ app.get('/dashboard', (req, res) => {
 });
 
 // ═══════════════════════════════════════════════════════════════
-// DÉMARRAGE SERVEUR
+// UTILITAIRES
+// ═══════════════════════════════════════════════════════════════
+
+function formatUptime(ms) {
+  const seconds = Math.floor(ms / 1000);
+  const minutes = Math.floor(seconds / 60);
+  const hours = Math.floor(minutes / 60);
+  const days = Math.floor(hours / 24);
+  
+  if (days > 0) return days + 'j ' + (hours % 24) + 'h';
+  if (hours > 0) return hours + 'h ' + (minutes % 60) + 'm';
+  if (minutes > 0) return minutes + 'm ' + (seconds % 60) + 's';
+  return seconds + 's';
+}
+
+// ═══════════════════════════════════════════════════════════════
+// DÉMARRAGE
 // ═══════════════════════════════════════════════════════════════
 
 app.listen(PORT, () => {
   console.log('');
   console.log('╔═══════════════════════════════════════════════════════╗');
-  console.log('║   Alzheimer Monitor - Proxy Server                    ║');
-  console.log('║   Arduino IoT Cloud Bridge                            ║');
+  console.log('║   Alzheimer Monitor - Standalone Server               ║');
+  console.log('║   Version 2.0 (Sans Arduino Cloud API)                ║');
   console.log('╚═══════════════════════════════════════════════════════╝');
   console.log('');
-  console.log(`🚀 Serveur démarré sur le port ${PORT}`);
+  console.log('🚀 Serveur démarré sur le port ' + PORT);
   console.log('');
   console.log('📡 Endpoints:');
-  console.log(`   POST http://localhost:${PORT}/api/data    - Recevoir JSON`);
-  console.log(`   GET  http://localhost:${PORT}/api/data    - Recevoir query params`);
-  console.log(`   GET  http://localhost:${PORT}/api/status  - Status serveur`);
-  console.log(`   GET  http://localhost:${PORT}/api/latest  - Dernières données`);
-  console.log(`   GET  http://localhost:${PORT}/dashboard   - Dashboard web`);
+  console.log('   POST/GET /api/data  - Recevoir données ESP32');
+  console.log('   GET /api/status     - Status serveur');
+  console.log('   GET /api/latest     - Dernières données');
+  console.log('   GET /api/history    - Historique');
+  console.log('   GET /api/alerts     - Historique alertes');
+  console.log('   GET /dashboard      - Dashboard web complet');
   console.log('');
-  
-  if (ARDUINO_CONFIG.CLIENT_ID === 'VOTRE_CLIENT_ID') {
-    console.log('⚠️  Arduino Cloud non configuré!');
-    console.log('   Modifiez ARDUINO_CONFIG dans server.js');
-    console.log('');
-  } else {
-    console.log('✅ Arduino Cloud configuré');
-    console.log(`   Thing ID: ${ARDUINO_CONFIG.THING_ID}`);
-    console.log('');
-  }
+  console.log('✅ Prêt à recevoir des données!');
+  console.log('');
 });
