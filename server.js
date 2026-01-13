@@ -30,16 +30,16 @@ const PORT = process.env.PORT || 3000;
 // https://create.arduino.cc/iot/things
 const ARDUINO_CONFIG = {
   // Client credentials (depuis Arduino Cloud → API Keys)
-  CLIENT_ID: 'VOTRE_CLIENT_ID',           // ← À configurer
-  CLIENT_SECRET: 'VOTRE_CLIENT_SECRET',   // ← À configurer
+  CLIENT_ID: '16f92ff3-1d43-4945-8c58-427eef27baac',           // ← À configurer
+  CLIENT_SECRET: 'zonmPEUkrfpZpgIylpRe98exw',   // ← À configurer
   
   // Thing ID (depuis l'URL de votre Thing)
-  THING_ID: 'VOTRE_THING_ID',             // ← À configurer
+  THING_ID: '659e4d98-8050-4d24-aafa-1c33d574dcaa',             // ← À configurer
   
   // IDs des variables (depuis Arduino Cloud → Thing → Variables)
   VARIABLES: {
-    location: 'VARIABLE_ID_LOCATION',      // ← À configurer
-    heartRate: 'VARIABLE_ID_HEARTRATE',    // ← À configurer
+    location: '8803b5df-5886-450a-807d-194a2d7ea8cb',      // ← À configurer
+    heartRate: '14b9b907-3409-4bb0-b779-26f79347491c',    // ← À configurer
     cloud_sensors: 'VARIABLE_ID_SENSORS',  // ← À configurer
     cloud_alerts: 'VARIABLE_ID_ALERTS',    // ← À configurer
     cloud_command: 'VARIABLE_ID_COMMAND'   // ← À configurer
